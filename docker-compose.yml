@@ -1,0 +1,29 @@
+services:
+  joblog:
+    build: .
+    image: joblog-api:1.0.0
+    container_name: joblog-api
+    restart: unless-stopped
+    ports:
+      - "${JOBLOG_PORT:-8000}:8000"
+    environment:
+      JOBLOG_DATA_DIR: /data
+      JOBLOG_DB_PATH: /data/joblogs/source.db
+      JOBLOG_BACKUPS_DIR: /data/backups
+      JOBLOG_RESTORE_DIR: /data/restores
+    volumes:
+      - joblog-data:/data
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  joblog-data:
