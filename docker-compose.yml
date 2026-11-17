@@ -1,7 +1,7 @@
 services:
   joblog:
     build: .
-    image: joblog-api:1.0.0
+    image: joblog-api:1.1.0
     container_name: joblog-api
     restart: unless-stopped
     ports:

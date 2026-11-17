@@ -41,6 +41,27 @@ CREATE TABLE IF NOT EXISTS backups (
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     completed_at   TEXT
 );
+
+-- One row per archived prefix.  A row is inserted in the SAME write
+-- transaction that deletes the covered rows from job_logs, so a segment
+-- registration and the source deletion can never be observed separately.
+-- Ready segments partition the archived id space into contiguous ranges:
+-- sequence 1 starts at id 1 and every later segment starts at the previous
+-- segment's end_id + 1, which is also the smallest id left in job_logs.
+CREATE TABLE IF NOT EXISTS archive_segments (
+    id             TEXT PRIMARY KEY,
+    sequence       INTEGER NOT NULL UNIQUE,
+    backup_id      TEXT NOT NULL UNIQUE,
+    start_id       INTEGER NOT NULL,
+    end_id         INTEGER NOT NULL,
+    row_count      INTEGER NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'ready'
+                   CHECK (status IN ('ready','failed')),
+    failure_reason TEXT,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (end_id >= start_id),
+    CHECK (row_count > 0)
+);
 """
 
 
@@ -102,5 +123,29 @@ class Database:
         conn = self.connect()
         try:
             yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection pinned to one committed snapshot.
+
+        ``BEGIN`` plus an immediate ``SELECT`` starts a deferred read
+        transaction, so every statement inside sees the same committed state.
+        A concurrent archiving commit therefore can never make the archive
+        registry and ``job_logs`` disagree within one query: appends and
+        queries see either the whole old state or the whole new state, never
+        a half-applied archive (no missing rows and no duplicated rows).
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN")
+            conn.execute("SELECT 1")
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
         finally:
             conn.close()

@@ -12,6 +12,12 @@ from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from .archive import (
+    ArchiveConflict,
+    ArchiveIntegrityError,
+    ArchiveManager,
+    ArchiveNotFound,
+)
 from .backup import (
     BackupError,
     BackupManager,
@@ -94,11 +100,41 @@ class RestoredLogView(BaseModel):
     row_count: int
 
 
+class ArchiveSegmentView(BaseModel):
+    id: str
+    sequence: int
+    backup_id: str
+    start_id: int
+    end_id: int
+    row_count: int
+    status: Literal["ready"]
+    created_at: str
+    failure_reason: str | None = None
+
+
+class ArchiveSegmentList(BaseModel):
+    items: list[ArchiveSegmentView]
+
+
+class ArchiveResultView(BaseModel):
+    id: str
+    sequence: int
+    backup_id: str
+    start_id: int
+    end_id: int
+    row_count: int
+    status: Literal["ready"]
+    created_at: str
+    source_remaining_min_id: int | None
+    source_remaining_count: int
+
+
 class Health(BaseModel):
     status: str
     database: str
     backups_dir: str
     restores_dir: str
+    archive_segments: int
 
 
 def create_app(
@@ -131,6 +167,7 @@ def create_app(
 
     database = Database(db_file)
     manager = BackupManager(database, backups)
+    archives = ArchiveManager(database, manager)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -138,21 +175,27 @@ def create_app(
         manager.ensure_dirs()
         restores.mkdir(parents=True, exist_ok=True)
         manager.recover_incomplete()
+        archive_stats = archives.startup_check()
+        app.state.archive_stats = archive_stats
         yield
 
     app = FastAPI(
         title="Job Log Service",
-        version="1.0.0",
+        version="1.1.0",
         description=(
-            "Append-only job logs with consistent, immutable backups and verified restore.\n\n"
-            "Backups are published only after the snapshot and its SHA-256 manifest have "
-            "been verified. Restores target an independent database file and leave the "
-            "source database writable."
+            "Append-only job logs with consistent, immutable backups, verified "
+            "restore and prefix archiving.\n\n"
+            "Backups are published only after the snapshot and its SHA-256 manifest "
+            "have been verified. Archiving moves the oldest contiguous source prefix "
+            "onto a verified, published backup: the segment registration and the "
+            "source deletion commit together, and /logs reads the archive chain and "
+            "the live table as one continuous, gap-checked id sequence."
         ),
         lifespan=lifespan,
     )
     app.state.database = database
     app.state.manager = manager
+    app.state.archives = archives
     app.state.restore_dir = restores
     app.state.paths = {
         "database": db_file,
@@ -162,11 +205,16 @@ def create_app(
 
     @app.get("/health", response_model=Health, tags=["ops"])
     def health() -> Health:
+        with database.reader() as conn:
+            segment_count = conn.execute(
+                "SELECT COUNT(*) FROM archive_segments WHERE status='ready'"
+            ).fetchone()[0]
         return Health(
             status="ok",
             database=db_file.as_posix(),
             backups_dir=backups.as_posix(),
             restores_dir=restores.as_posix(),
+            archive_segments=int(segment_count),
         )
 
     @app.post(
@@ -189,23 +237,34 @@ def create_app(
         return LogEntry(**dict(row))
 
     @app.get(
-        "/logs", response_model=LogList, tags=["logs"], summary="Query committed logs"
+        "/logs",
+        response_model=LogList,
+        tags=["logs"],
+        summary="Query committed logs across archive segments and the live table",
+        description=(
+            "Returns logs in ascending id order, transparently merging every "
+            "verified archive segment with the rows still held in the source "
+            "database. Supports the same job_id, after_id and limit parameters "
+            "before and after archiving. If an archive segment is corrupt or the "
+            "archive chain is broken, the request fails explicitly instead of "
+            "returning a result set with missing rows."
+        ),
     )
     def list_logs(
         job_id: str | None = Query(default=None),
         after_id: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> LogList:
-        sql = "SELECT id, job_id, message, created_at FROM job_logs WHERE id > ?"
-        params: list[object] = [after_id]
-        if job_id is not None:
-            sql += " AND job_id = ?"
-            params.append(job_id)
-        sql += " ORDER BY id LIMIT ?"
-        params.append(limit)
-        with database.reader() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        items = [LogEntry(**dict(r)) for r in rows]
+        try:
+            merged = archives.query_logs(
+                job_id=job_id, after_id=after_id, limit=limit
+            )
+        except ArchiveIntegrityError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"archive integrity check failed, refusing partial results: {exc}",
+            ) from exc
+        items = [LogEntry(**entry) for entry in merged]
         return LogList(items=items, next_after_id=items[-1].id if items else None)
 
     @app.post(
@@ -327,6 +386,65 @@ def create_app(
             row_count=result.row_count,
             max_id=result.max_id,
         )
+
+    # --------------------------------------------------------------- archive
+    @app.post(
+        "/backups/{backup_id}/archive",
+        response_model=ArchiveResultView,
+        tags=["archive"],
+        summary="Archive the earliest source prefix covered by a published backup",
+        description=(
+            "Verifies the backup again, confirms that its rows are exactly the "
+            "next contiguous prefix still present in the source table and match "
+            "row for row, then registers the archive segment and deletes those "
+            "source rows in one transaction. On a damaged backup or any failure "
+            "nothing is deleted: every not-yet-archived source log stays "
+            "queryable. A later backup can archive the next prefix afterwards."
+        ),
+    )
+    def archive_prefix(backup_id: str) -> ArchiveResultView:
+        try:
+            segment = archives.archive_by_backup(backup_id)
+        except ArchiveNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ArchiveConflict as exc:
+            raise HTTPException(
+                status_code=409, detail=f"archive refused: {exc}"
+            ) from exc
+        except (ArchiveIntegrityError, BackupError, sqlite3.Error, OSError) as exc:
+            raise HTTPException(
+                status_code=500, detail=f"archive failed: {exc}"
+            ) from exc
+        with database.reader() as conn:
+            remaining_min, remaining_count = conn.execute(
+                "SELECT MIN(id), COUNT(*) FROM job_logs"
+            ).fetchone()
+        return ArchiveResultView(
+            **segment,
+            source_remaining_min_id=remaining_min,
+            source_remaining_count=int(remaining_count),
+        )
+
+    @app.get(
+        "/archive/segments",
+        response_model=ArchiveSegmentList,
+        tags=["archive"],
+        summary="List registered archive segments in chain order",
+    )
+    def list_archive_segments() -> ArchiveSegmentList:
+        return ArchiveSegmentList(items=archives.list_segments())
+
+    @app.get(
+        "/archive/segments/{segment_id}",
+        response_model=ArchiveSegmentView,
+        tags=["archive"],
+        summary="Get one archive segment registration",
+    )
+    def get_archive_segment(segment_id: str) -> ArchiveSegmentView:
+        try:
+            return ArchiveSegmentView(**archives.get_segment(segment_id))
+        except ArchiveNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get(
         "/restores/{target_name}/logs",
